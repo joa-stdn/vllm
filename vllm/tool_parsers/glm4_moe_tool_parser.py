@@ -290,8 +290,21 @@ class Glm4MoeModelToolParser(ToolParser):
             self._sent_content_idx = pos
         return None
 
-    def _extract_tool_call_regions(self, text: str) -> list[tuple[str, bool]]:
-        """Extract ``(inner_text, is_complete)`` for each ``<tool_call>`` region."""
+    def _extract_tool_call_regions(
+        self,
+        text: str,
+        current_token_ids: Sequence[int] | None = None,
+    ) -> list[tuple[str, bool]]:
+        """Extract ``(inner_text, is_complete)`` for each ``<tool_call>`` region.
+
+        The end of a tool call is normally detected by finding
+        ``</tool_call>`` in ``text``. When that token is the engine's stop
+        token and gets stripped from the detokenized output (single
+        special-token stop, e.g. GLM-4.5 / 5.1 with MTP or a non-trivial
+        stream interval), the trailing region's closing tag is missing from
+        ``text``; in that case we fall back to counting end-token IDs in
+        ``current_token_ids`` so we don't leave the JSON args unclosed.
+        """
         results: list[tuple[str, bool]] = []
         pos = 0
         while True:
@@ -311,6 +324,22 @@ class Glm4MoeModelToolParser(ToolParser):
                     raw = raw[:-overlap]
                 results.append((raw, False))
                 break
+
+        # Token-id fallback: if the trailing region's </tool_call> text is
+        # missing but the end-token id was emitted, promote it to complete.
+        if (
+            results
+            and not results[-1][1]
+            and current_token_ids is not None
+            and self.tool_call_end_token_id is not None
+        ):
+            end_id_count = sum(
+                1 for t in current_token_ids if t == self.tool_call_end_token_id
+            )
+            complete_count = sum(1 for _, c in results if c)
+            if end_id_count > complete_count:
+                results[-1] = (results[-1][0], True)
+
         return results
 
     def _extract_tool_name_from_region(self, inner_text: str) -> str | None:
@@ -451,7 +480,7 @@ class Glm4MoeModelToolParser(ToolParser):
             return DeltaMessage(content=delta_text) if delta_text else None
 
         content = self._extract_content(current_text)
-        regions = self._extract_tool_call_regions(current_text)
+        regions = self._extract_tool_call_regions(current_text, current_token_ids)
         tool_call_deltas: list[DeltaToolCall] = []
 
         for i, (inner_text, is_complete) in enumerate(regions):
