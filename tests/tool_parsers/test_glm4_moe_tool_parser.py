@@ -621,6 +621,101 @@ def test_streaming_multiple_tool_calls_sequential(glm4_moe_tool_parser, mock_req
     assert args1["city"] == "Shanghai"
 
 
+@pytest.mark.parametrize(
+    ("desc", "end_token_in_token_ids", "expected_args"),
+    [
+        ("end_text_stripped_but_id_present", True, {"city": "Beijing"}),
+        ("end_text_missing_and_no_id_stays_open", False, None),
+    ],
+)
+def test_streaming_trailing_region_token_id_fallback(
+    glm4_moe_tool_parser,
+    mock_request,
+    desc: str,
+    end_token_in_token_ids: bool,
+    expected_args: dict | None,
+):
+    """Regression: when ``</tool_call>`` is a single special token used as the
+    stop token (GLM-4.5 / 5.1), the v1 detokenizer strips it from the public
+    output so the parser's substring scan never sees it. The parser must fall
+    back to ``current_token_ids`` and still treat the region as complete,
+    otherwise the final JSON args are emitted without their closing brace.
+    """
+    _reset_streaming_state(glm4_moe_tool_parser)
+
+    end_token_id = glm4_moe_tool_parser.tool_call_end_token_id
+    assert end_token_id is not None, (
+        "Test assumes the GLM-4.5 tokenizer has </tool_call> as a known token."
+    )
+
+    # </tool_call> intentionally omitted from the text (single-special-token stop).
+    current_text = (
+        "<tool_call>get_weather\n"
+        "<arg_key>city</arg_key><arg_value>Beijing</arg_value>"
+    )
+    current_token_ids = [end_token_id] if end_token_in_token_ids else []
+
+    glm4_moe_tool_parser.extract_tool_calls_streaming(
+        previous_text="",
+        current_text=current_text,
+        delta_text=current_text,
+        previous_token_ids=[],
+        current_token_ids=current_token_ids,
+        delta_token_ids=list(current_token_ids),
+        request=mock_request,
+    )
+
+    stored_args = glm4_moe_tool_parser.prev_tool_call_arr[0].get("arguments", "")
+    assert isinstance(stored_args, str)
+    if expected_args is None:
+        # Without the fallback signal, the region must stay open (missing }).
+        assert stored_args == '{"city": "Beijing"', stored_args
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(stored_args)
+    else:
+        # Fallback triggers: args must be valid, fully-closed JSON.
+        assert json.loads(stored_args) == expected_args
+
+
+def test_streaming_multi_tool_only_trailing_end_stripped(
+    glm4_moe_tool_parser, mock_request
+):
+    """Multi-tool: first ``</tool_call>`` is in text, the trailing one is
+    stripped. The trailing-region fallback must close only the unfinished
+    region, leaving the already-closed one untouched.
+    """
+    _reset_streaming_state(glm4_moe_tool_parser)
+    end_token_id = glm4_moe_tool_parser.tool_call_end_token_id
+    assert end_token_id is not None
+
+    current_text = (
+        "<tool_call>get_weather\n"
+        "<arg_key>city</arg_key><arg_value>Beijing</arg_value></tool_call>"
+        "<tool_call>get_weather\n"
+        "<arg_key>city</arg_key><arg_value>Shanghai</arg_value>"
+    )
+    # Two end-token IDs were emitted (one per call); only the first's text
+    # survived detokenization.
+    current_token_ids = [end_token_id, end_token_id]
+
+    glm4_moe_tool_parser.extract_tool_calls_streaming(
+        previous_text="",
+        current_text=current_text,
+        delta_text=current_text,
+        previous_token_ids=[],
+        current_token_ids=current_token_ids,
+        delta_token_ids=list(current_token_ids),
+        request=mock_request,
+    )
+
+    assert len(glm4_moe_tool_parser.prev_tool_call_arr) == 2
+    for idx, expected_city in enumerate(["Beijing", "Shanghai"]):
+        args_str = glm4_moe_tool_parser.prev_tool_call_arr[idx]["arguments"]
+        assert json.loads(args_str) == {"city": expected_city}, (
+            f"tool call {idx}: expected city={expected_city}, got {args_str!r}"
+        )
+
+
 def test_streaming_json_escape_in_string(glm4_moe_tool_parser, mock_request):
     """Test that special characters in string values are properly escaped."""
     _reset_streaming_state(glm4_moe_tool_parser)
